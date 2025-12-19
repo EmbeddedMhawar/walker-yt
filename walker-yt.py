@@ -192,31 +192,73 @@ def process_audio(video_id, mode):
     else:
         return os.path.join(base_out, "no_vocals.wav")
 
-def select_quality():
-    """Prompt user for video quality."""
-    options = [
-        "🌟 Max (4K/8K)",
-        "🖥️ 1080p",
-        "💻 720p",
-        "📱 480p",
-        "📉 360p"
+def get_video_qualities(video_id):
+    """Fetch available resolutions and FPS for the video."""
+    cmd = [
+        YT_DLP_BIN,
+        "--dump-json",
+        "--no-playlist",
+        "https://www.youtube.com/watch?v=" + video_id
     ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        formats = data.get('formats', [])
+        
+        # Store (height, fps) pairs
+        quality_map = {}
+        for f in formats:
+            h = f.get('height')
+            fps = f.get('fps')
+            if h and f.get('vcodec') != 'none':
+                if h not in quality_map:
+                    quality_map[h] = set()
+                if fps:
+                    quality_map[h].add(int(fps))
+        
+        # Build display strings
+        options = []
+        for h in sorted(quality_map.keys(), reverse=True):
+            f_list = sorted(list(quality_map[h]), reverse=True)
+            if f_list:
+                for fps in f_list:
+                    # Only show FPS if it's high (>= 50) or if it's the only one
+                    if fps >= 50 or len(f_list) == 1:
+                        options.append(f"{h}p{fps}")
+                    elif fps == 30 and 60 not in quality_map[h]:
+                         options.append(f"{h}p{fps}")
+            else:
+                options.append(f"{h}p")
+        
+        # Clean up duplicates like 1080p60 and 1080p30 if they exist
+        return options
+    except Exception:
+        return []
+
+def select_quality(video_id):
+    """Prompt user for video quality."""
+    notify("Quality", "Fetching available resolutions & FPS...", urgency="low")
+    options = get_video_qualities(video_id)
+    
+    if not options:
+        # Fallback
+        options = ["1080p60", "1080p30", "720p60", "720p30", "480p", "360p"]
+    
     selection = walker_dmenu("Select Video Quality", options)
     
     if not selection:
         return None
         
-    if "Max" in selection:
-        return "bestvideo"
-    elif "1080p" in selection:
-        return "bestvideo[height<=1080]"
-    elif "720p" in selection:
-        return "bestvideo[height<=720]"
-    elif "480p" in selection:
-        return "bestvideo[height<=480]"
-    elif "360p" in selection:
-        return "bestvideo[height<=360]"
-    return "bestvideo" # Default
+    # Extract height and fps from "1080p60"
+    match = re.match(r'(\d+)p(\d+)?', selection)
+    if match:
+        height = match.group(1)
+        fps = match.group(2)
+        if fps:
+            return f"bestvideo[height<={height}][fps<={fps}]"
+        return f"bestvideo[height<={height}]"
+    
+    return "bestvideo"
 
 def get_subtitles(video_id):
     """Fetch available subtitles."""
@@ -356,7 +398,7 @@ def main():
     
     if "Select Quality" in action_str:
         # 1. Quality
-        quality_setting = select_quality()
+        quality_setting = select_quality(selected_video['id'])
         if not quality_setting:
             return # Cancelled
         
