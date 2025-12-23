@@ -6,6 +6,8 @@ import os
 import shutil
 import tempfile
 import re
+import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # Configuration
@@ -93,10 +95,9 @@ def download_thumbnail(url, video_id):
     return path
 
 def process_audio(video_id, mode):
-    """Download and separate audio."""
+    """Download and separate audio with RAM-safe chunked processing."""
     # mode: 'vocals' (keep vocals) or 'music' (keep music/no_vocals)
     
-    # Initial notification
     nid = notify("Processing", "Step 1/2: Downloading audio...", urgency="critical", progress=0)
     
     work_dir = os.path.join(CACHE_DIR, "proc_" + video_id)
@@ -105,8 +106,6 @@ def process_audio(video_id, mode):
     # 1. Download Audio
     audio_path = os.path.join(work_dir, "input.m4a")
     if not os.path.exists(audio_path):
-        # yt-dlp doesn't give easy progress we can parse reliably without complex logic,
-        # so just pulse/unknown progress for download.
         subprocess.run([
             YT_DLP_BIN,
             "-f", "bestaudio[ext=m4a]/bestaudio",
@@ -115,82 +114,80 @@ def process_audio(video_id, mode):
             video_id
         ], check=True)
     
-    # Update notification for separation start
-    nid = notify("Processing", "Step 2/2: Separating stems...", urgency="critical", progress=0, replace_id=nid)
+    nid = notify("Processing", "Step 2/2: Separating stems (Buffer & Play)...", urgency="critical", progress=0, replace_id=nid)
 
-    # 2. Run Demucs
-    # Output structure: <out>/htdemucs/input/vocals.wav
+    # 2. Run Demucs with RAM-safe flags
+    # --segment 7: Prevents RAM spikes by processing in 7s chunks (htdemucs limit is 7.8)
+    # --shifts 0: Reduces memory/CPU usage
+    # -j 2: Limits CPU threads to keep system responsive
     cmd = [
+        "nice", "-n", "19",
+        "ionice", "-c", "3",
         DEMUCS_BIN,
         "-n", "htdemucs",
-        "--two-stems=vocals", # Separates into 'vocals' and 'no_vocals'
+        "--two-stems=vocals",
+        "--segment", "7",
+        "--shifts", "0",
+        "-j", "2",
         "-o", work_dir,
         audio_path
     ]
     
-    try:
-        # Run process and read stderr for tqdm progress
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-        
-        # Buffer to accumulate characters to find percentage
+    # Output path
+    base_out = os.path.join(work_dir, "htdemucs", "input")
+    target_file = os.path.join(base_out, "vocals.wav" if mode == "vocals" else "no_vocals.wav")
+
+    # Start Demucs
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        universal_newlines=True
+    )
+
+    def monitor_progress(proc, notification_id):
         buf = ""
         last_percent = -1
         while True:
-            # Read character by character to handle \r
-            # We explicitly check for stderr existence to satisfy linters, though PIPE guarantees it.
-            if process.stderr:
-                char = process.stderr.read(1)
+            if proc.stderr:
+                char = proc.stderr.read(1)
             else:
                 char = ""
-                
-            if not char and process.poll() is not None:
+            if not char and proc.poll() is not None:
                 break
             if char:
                 buf += char
                 if char in ('\r', '\n'):
-                    # Analyze the line/segment
-                    # Tqdm output example: " 15%|###   | ..."
                     if "%" in buf:
                         match = re.search(r'(\d+)%', buf)
                         if match:
                             percent = int(match.group(1))
-                            # Update notification if percentage changed (to avoid spam but keep it smooth)
                             if percent != last_percent:
-                                nid = notify("Processing", f"Separating: {percent}%", urgency="critical", progress=percent, replace_id=nid)
+                                notify("Processing", f"Separating: {percent}%", urgency="critical", progress=percent, replace_id=notification_id)
                                 last_percent = percent
                     buf = ""
-        
-        # Check return code
-        if process.returncode != 0:
-            if process.stderr:
-                 err = process.stderr.read()
-            else:
-                 err = "Unknown error"
-            raise subprocess.CalledProcessError(process.returncode, cmd, stderr=err)
-            
-    except subprocess.CalledProcessError as e:
-        notify("Error", f"Demucs failed:\n{e.stderr}", urgency="critical", replace_id=nid)
-        raise e
-    
-    # Final success update
-    notify("Processing", "Done! Opening player...", urgency="normal", progress=100, replace_id=nid)
+        notify("Processing", "Done! Streaming audio...", urgency="normal", progress=100, replace_id=notification_id)
 
-    # 3. Find output
-    # Demucs output is usually inside the model name folder, then filename (without ext)
-    # input filename is 'input'
-    base_out = os.path.join(work_dir, "htdemucs", "input")
-    
-    if mode == "vocals":
-        return os.path.join(base_out, "vocals.wav")
-    else:
-        return os.path.join(base_out, "no_vocals.wav")
+    # Run monitor in background thread
+    threading.Thread(target=monitor_progress, args=(process, nid), daemon=True).start()
+
+    # Wait for the first chunk to be written (Buffer & Play)
+    start_time = time.time()
+    while not os.path.exists(target_file) or os.path.getsize(target_file) < 1024:
+        if process.poll() is not None:
+            # If process finished or failed before file created
+            if process.returncode != 0:
+                 stderr_out = process.stderr.read() if process.stderr else "Unknown error"
+                 raise Exception(f"Demucs failed: {stderr_out[:200]}")
+            break
+        if time.time() - start_time > 120: # Increase to 2 mins for large files/slow CPU
+            raise Exception("Timeout waiting for audio buffer. System might be too slow.")
+        time.sleep(1)
+
+    return target_file
+
 
 def get_video_qualities(video_id):
     """Fetch available resolutions and FPS for the video."""
@@ -390,7 +387,14 @@ def main():
 
     url = f"https://www.youtube.com/watch?v={selected_video['id']}"
     
-    mpv_cmd = ["mpv", "--script-opts=ytdl_hook-ytdl_path=" + YT_DLP_BIN, "--force-window"]
+    mpv_cmd = [
+        "mpv", 
+        "--script-opts=ytdl_hook-ytdl_path=" + YT_DLP_BIN, 
+        "--force-window",
+        "--cache=yes",
+        "--cache-pause-wait=5", # Wait for 5s of buffer before resuming if it hits end
+        "--demuxer-readahead-secs=20" # Buffer 20s ahead
+    ]
     
     # Logic Handling
     video_format = "bestvideo+bestaudio/best" # Default normal watch
