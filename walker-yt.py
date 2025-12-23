@@ -117,22 +117,31 @@ def process_audio(video_id, mode):
     nid = notify("Processing", "Step 2/2: Separating stems (Buffer & Play)...", urgency="critical", progress=0, replace_id=nid)
 
     # 2. Run Demucs with RAM-safe flags
-    # --segment 7: Prevents RAM spikes by processing in 7s chunks (htdemucs limit is 7.8)
+    # --segment 4: Smaller segments for even lower RAM usage
     # --shifts 0: Reduces memory/CPU usage
-    # -j 2: Limits CPU threads to keep system responsive
+    # -j 1: Single thread for predictable memory footprint
+    # -d cpu: Force CPU to avoid unstable iGPU acceleration
     cmd = [
         "nice", "-n", "19",
         "ionice", "-c", "3",
         DEMUCS_BIN,
         "-n", "htdemucs",
         "--two-stems=vocals",
-        "--segment", "7",
+        "--segment", "4",
         "--shifts", "0",
-        "-j", "2",
+        "-j", "1",
+        "-d", "cpu",
         "-o", work_dir,
         audio_path
     ]
     
+    # Environment variables to restrict resource usage
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["VECLIB_MAXIMUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
+
     # Output path
     base_out = os.path.join(work_dir, "htdemucs", "input")
     target_file = os.path.join(base_out, "vocals.wav" if mode == "vocals" else "no_vocals.wav")
@@ -144,7 +153,8 @@ def process_audio(video_id, mode):
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        universal_newlines=True
+        universal_newlines=True,
+        env=env
     )
 
     def monitor_progress(proc, notification_id):
