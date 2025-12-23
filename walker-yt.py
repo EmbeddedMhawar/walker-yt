@@ -98,6 +98,12 @@ def process_audio(video_id, mode):
     """Download and separate audio with RAM-safe chunked processing."""
     # mode: 'vocals' (keep vocals) or 'music' (keep music/no_vocals)
     
+    # Cleanup any existing demucs processes to free RAM
+    try:
+        subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
     nid = notify("Processing", "Step 1/2: Downloading audio...", urgency="critical", progress=0)
     
     work_dir = os.path.join(CACHE_DIR, "proc_" + video_id)
@@ -162,43 +168,56 @@ def process_audio(video_id, mode):
     def monitor_progress(proc, notification_id):
         buf = ""
         last_percent = -1
-        while True:
-            if proc.stderr:
-                char = proc.stderr.read(1)
-            else:
-                char = ""
-            if not char and proc.poll() is not None:
-                break
-            if char:
-                buf += char
-                if char in ('\r', '\n'):
-                    if "%" in buf:
-                        match = re.search(r'(\d+)%', buf)
-                        if match:
-                            percent = int(match.group(1))
-                            if percent != last_percent:
-                                notify("Processing", f"Separating: {percent}%", urgency="critical", progress=percent, replace_id=notification_id)
-                                last_percent = percent
-                    buf = ""
-        notify("Processing", "Done! Streaming audio...", urgency="normal", progress=100, replace_id=notification_id)
+        try:
+            while True:
+                if proc.stderr:
+                    char = proc.stderr.read(1)
+                else:
+                    char = ""
+                if not char and proc.poll() is not None:
+                    break
+                if char:
+                    buf += char
+                    if char in ('\r', '\n'):
+                        if "%" in buf:
+                            match = re.search(r'(\d+)%', buf)
+                            if match:
+                                percent = int(match.group(1))
+                                if percent != last_percent:
+                                    notify("Processing", f"Separating: {percent}%", urgency="critical", progress=percent, replace_id=notification_id)
+                                    last_percent = percent
+                        buf = ""
+            if proc.returncode == 0:
+                notify("Processing", "Done! Streaming audio...", urgency="normal", progress=100, replace_id=notification_id)
+        except Exception:
+            pass
 
     # Run monitor in background thread
     threading.Thread(target=monitor_progress, args=(process, nid), daemon=True).start()
 
-    # Wait for the first chunk to be written (Buffer & Play)
-    start_time = time.time()
-    while not os.path.exists(target_file) or os.path.getsize(target_file) < 1024:
-        if process.poll() is not None:
-            # If process finished or failed before file created
-            if process.returncode != 0:
-                 stderr_out = process.stderr.read() if process.stderr else "Unknown error"
-                 if "OOM" in stderr_out or process.returncode in [137, 127]: # 137 is SIGKILL
-                     raise Exception("System killed Demucs to save RAM. Try a shorter video or close other apps.")
-                 raise Exception(f"Demucs failed: {stderr_out[:200]}")
-            break
-        if time.time() - start_time > 180: # 3 mins for safer start
-            raise Exception("Timeout waiting for audio buffer. Process may have been throttled or killed.")
-        time.sleep(1)
+    try:
+        # Wait for the first chunk to be written (Buffer & Play)
+        start_time = time.time()
+        while not os.path.exists(target_file) or os.path.getsize(target_file) < 1024:
+            if process.poll() is not None:
+                # If process finished or failed before file created
+                if process.returncode != 0:
+                     stderr_out = process.stderr.read() if process.stderr else "Unknown error"
+                     if "OOM" in stderr_out or process.returncode in [137, 127]: # 137 is SIGKILL
+                         raise Exception("System killed Demucs to save RAM. Try a shorter video or close other apps.")
+                     raise Exception(f"Demucs failed: {stderr_out[:200]}")
+                break
+            if time.time() - start_time > 180: # 3 mins for safer start
+                raise Exception("Timeout waiting for audio buffer. Process may have been throttled or killed.")
+            time.sleep(1)
+    except Exception as e:
+        # If we time out or fail, kill the process so it doesn't become a zombie
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        raise e
 
     return target_file
 
