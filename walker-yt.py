@@ -118,12 +118,12 @@ def process_audio(video_id, mode):
 
     # 2. Run Demucs with RAM-safe flags and Hard isolation
     # systemd-run --user --scope: Places the process in a memory-capped jail
-    # MemoryMax=4G: System will kill Demucs if it hits 4G, saving your screen/Hyprland.
+    # MemoryMax=6G: Safe limit for 16GB system
     cmd = [
         "systemd-run", "--user", "--scope",
-        "-p", "MemoryMax=4G",
-        "-p", "MemoryHigh=3.5G",
-        "-p", "CPUWeight=20",
+        "-p", "MemoryMax=6G",
+        "-p", "MemoryHigh=5.5G",
+        "-p", "CPUWeight=100",
         "nice", "-n", "19",
         "ionice", "-c", "3",
         DEMUCS_BIN,
@@ -131,7 +131,7 @@ def process_audio(video_id, mode):
         "--two-stems=vocals",
         "--segment", "4",
         "--shifts", "0",
-        "-j", "1",
+        "-j", "4",
         "-d", "cpu",
         "-o", work_dir,
         audio_path
@@ -139,10 +139,10 @@ def process_audio(video_id, mode):
     
     # Environment variables to restrict resource usage
     env = os.environ.copy()
-    env["OMP_NUM_THREADS"] = "1"
-    env["MKL_NUM_THREADS"] = "1"
-    env["VECLIB_MAXIMUM_THREADS"] = "1"
-    env["NUMEXPR_NUM_THREADS"] = "1"
+    env["OMP_NUM_THREADS"] = "4"
+    env["MKL_NUM_THREADS"] = "4"
+    env["VECLIB_MAXIMUM_THREADS"] = "4"
+    env["NUMEXPR_NUM_THREADS"] = "4"
 
     # Output path
     base_out = os.path.join(work_dir, "htdemucs", "input")
