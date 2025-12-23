@@ -8,9 +8,7 @@ import tempfile
 import re
 import time
 import threading
-import socket
 import signal
-from concurrent.futures import ThreadPoolExecutor
 
 # Configuration
 VENV_PATH = os.path.expanduser("~/.local/share/walker-yt/venv")
@@ -142,17 +140,13 @@ def select_subtitles(video_id):
     return match.group(1) if match else None
 
 def process_audio(video_id, mode):
-    """Download and separate audio using high-quality htdemucs with Split & TCP Stream architecture."""
+    """Download and separate audio using high-quality htdemucs with optimized streaming."""
     my_pid = os.getpid()
-    # Cleanup previous sessions: Kill old scripts, demucs, and players
     try:
-        # Kill other walker-yt script instances
         out = subprocess.check_output(["pgrep", "-f", "walker-yt"], text=True)
         for pid_str in out.splitlines():
             pid = int(pid_str)
-            if pid != my_pid:
-                os.kill(pid, signal.SIGTERM)
-        # Kill AI and Player
+            if pid != my_pid: os.kill(pid, signal.SIGTERM)
         subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
         subprocess.run(["pkill", "-f", "mpv.*--title=walker-yt"], stderr=subprocess.DEVNULL)
     except: pass
@@ -179,17 +173,11 @@ def process_audio(video_id, mode):
             total = len(sorted_chunks)
             for i, chunk_file in enumerate(sorted_chunks):
                 chunk_path = os.path.join(chunks_dir, chunk_file)
-                cmd = ["systemd-run", "--user", "--scope", 
-                       "-p", "MemoryMax=10G", 
-                       "-p", "CPUWeight=100",
-                       "-p", "CPUQuota=50%",
-                       "-E", "OMP_NUM_THREADS=1",
-                       "-E", "MKL_NUM_THREADS=1",
-                       "-E", "OPENBLAS_NUM_THREADS=1",
-                       "-E", "VECLIB_MAXIMUM_THREADS=1",
-                       DEMUCS_BIN, "-n", "htdemucs", "--two-stems=vocals", 
-                       "--segment", "7", "--shifts", "0", "--overlap", "0.1", 
-                       "-d", "cpu", "-j", "2", "-o", out_chunks_dir, chunk_path]
+                # Maximized CPU usage: 8 threads and 400% quota
+                cmd = ["systemd-run", "--user", "--scope", "-p", "MemoryMax=10G", "-p", "CPUQuota=400%",
+                       "-E", "OMP_NUM_THREADS=8", "-E", "MKL_NUM_THREADS=8",
+                       "-E", "OPENBLAS_NUM_THREADS=8", "-E", "VECLIB_MAXIMUM_THREADS=8",
+                       DEMUCS_BIN, "-n", "htdemucs", "--two-stems=vocals", "--segment", "7", "--shifts", "0", "--overlap", "0.1", "-d", "cpu", "-j", "1", "-o", out_chunks_dir, chunk_path]
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 chunk_base = os.path.splitext(chunk_file)[0]
                 separated_wav = os.path.join(out_chunks_dir, "htdemucs", chunk_base, "vocals.wav" if mode == "vocals" else "no_vocals.wav")
@@ -259,40 +247,17 @@ def main():
         mode = "vocals" if "Keep Vocals" in action_str else "music"
         try:
             audio_pcm, worker = process_audio(selected_video['id'], mode)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]; sock.listen(1)
+            tail_proc = subprocess.Popen(["tail", "-f", "-c", "+0", audio_pcm], stdout=subprocess.PIPE)
+            live_args = ["--audio-file=fd://0", "--audio-demuxer=rawaudio", "--demuxer-rawaudio-rate=44100", "--demuxer-rawaudio-channels=2", "--demuxer-rawaudio-format=s16le", "--cache=yes", "--cache-secs=3600", "--aid=1"]
             
-            def tcp_streamer():
-                try:
-                    conn, _ = sock.accept()
-                    with open(audio_pcm, "rb") as f:
-                        while True:
-                            data = f.read(16384)
-                            if data: conn.sendall(data)
-                            else:
-                                if not worker.is_alive():
-                                    rem = f.read();
-                                    if rem: conn.sendall(rem)
-                                    break
-                                time.sleep(0.1)
-                    conn.close()
-                except: pass
-                finally: sock.close()
-
-            threading.Thread(target=tcp_streamer, daemon=True).start()
-            live_args = [f"--audio-file=tcp://127.0.0.1:{port}", "--audio-demuxer=rawaudio", "--demuxer-rawaudio-rate=44100", "--demuxer-rawaudio-channels=2", "--demuxer-rawaudio-format=s16le", "--cache=yes", "--cache-secs=300", "--aid=1"]
             if "Select Quality" not in action_str: video_format = "bestvideo"
             elif "bestvideo" not in video_format: video_format = "bestvideo"
-            player_proc = subprocess.Popen(mpv_cmd + [url, f"--ytdl-format={video_format}"] + live_args + sub_args)
             
-            # Wait for mpv to close
-            while player_proc.poll() is None:
-                time.sleep(1)
+            player_proc = subprocess.Popen(mpv_cmd + [url, f"--ytdl-format={video_format}"] + live_args + sub_args, stdin=tail_proc.stdout)
+            if tail_proc.stdout: tail_proc.stdout.close()
             
-            log("MAIN: Player closed. Shutting down.")
-            # Safety: Kill demucs processes when player closes
-            try: subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
-            except: pass
+            while player_proc.poll() is None: time.sleep(1)
+            tail_proc.terminate(); subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
         except Exception as e: notify("Error", f"Failed: {e}")
 
 if __name__ == "__main__": main()
