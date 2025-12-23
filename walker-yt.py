@@ -124,16 +124,17 @@ def process_audio(video_id, mode):
 
     # 2. Run Demucs with RAM-safe flags and Hard isolation
     # systemd-run --user --scope: Places the process in a memory-capped jail
-    # MemoryMax=6G: Safe limit for 16GB system
+    # MemoryMax=10G: Hard limit to prevent system crash
+    # -n mdx_extra: Use a slightly more memory-efficient model than htdemucs
     cmd = [
         "systemd-run", "--user", "--scope",
-        "-p", "MemoryMax=6G",
-        "-p", "MemoryHigh=5.5G",
+        "-p", "MemoryMax=10G",
+        "-p", "MemoryHigh=8G",
         "-p", "CPUWeight=100",
         "nice", "-n", "19",
         "ionice", "-c", "3",
         DEMUCS_BIN,
-        "-n", "htdemucs",
+        "-n", "mdx_extra",
         "--two-stems=vocals",
         "--segment", "4",
         "--shifts", "0",
@@ -151,7 +152,9 @@ def process_audio(video_id, mode):
     env["NUMEXPR_NUM_THREADS"] = "4"
 
     # Output path
-    base_out = os.path.join(work_dir, "htdemucs", "input")
+    # Demucs creates a folder named after the model
+    model_name = "mdx_extra"
+    base_out = os.path.join(work_dir, model_name, "input")
     target_file = os.path.join(base_out, "vocals.wav" if mode == "vocals" else "no_vocals.wav")
 
     # Start Demucs
@@ -165,7 +168,8 @@ def process_audio(video_id, mode):
         env=env
     )
 
-    def monitor_progress(proc, notification_id):
+    last_errors = []
+    def monitor_progress(proc, notification_id, error_log):
         buf = ""
         last_percent = -1
         try:
@@ -179,6 +183,12 @@ def process_audio(video_id, mode):
                 if char:
                     buf += char
                     if char in ('\r', '\n'):
+                        line = buf.strip()
+                        if line:
+                            error_log.append(line)
+                            if len(error_log) > 10:
+                                error_log.pop(0)
+                        
                         if "%" in buf:
                             match = re.search(r'(\d+)%', buf)
                             if match:
@@ -193,7 +203,7 @@ def process_audio(video_id, mode):
             pass
 
     # Run monitor in background thread
-    threading.Thread(target=monitor_progress, args=(process, nid), daemon=True).start()
+    threading.Thread(target=monitor_progress, args=(process, nid, last_errors), daemon=True).start()
 
     try:
         # Wait for the first chunk to be written (Buffer & Play)
@@ -202,7 +212,10 @@ def process_audio(video_id, mode):
             if process.poll() is not None:
                 # If process finished or failed before file created
                 if process.returncode != 0:
-                     stderr_out = process.stderr.read() if process.stderr else "Unknown error"
+                     stderr_out = "\n".join(last_errors)
+                     if not stderr_out:
+                         stderr_out = "Process died unexpectedly."
+                     
                      if "OOM" in stderr_out or process.returncode in [137, 127]: # 137 is SIGKILL
                          raise Exception("System killed Demucs to save RAM. Try a shorter video or close other apps.")
                      raise Exception(f"Demucs failed: {stderr_out[:200]}")
