@@ -11,20 +11,20 @@ import threading
 import socket
 from concurrent.futures import ThreadPoolExecutor
 
-# Configuration
-VENV_PATH = os.path.expanduser("~/.local/share/walker-yt/venv")
-DEMUCS_BIN = os.path.join(VENV_PATH, "bin", "demucs")
-YT_DLP_BIN = os.path.join(os.path.expanduser("~/.local/bin"), "yt-dlp")
-if not os.path.exists(YT_DLP_BIN):
-    YT_DLP_BIN = "yt-dlp"
-
-CACHE_DIR = os.path.expanduser("~/.cache/walker-yt")
-os.makedirs(CACHE_DIR, exist_ok=True)
-
+import signal
 
 def log(message):
     with open("/tmp/walker-yt.log", "a") as f:
         f.write(f"[{time.strftime('%H:%M:%S')}] {message}\n")
+
+def cleanup_handler(sig, frame):
+    log(f"Received signal {sig}. Cleaning up...")
+    try: subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
+    except: pass
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup_handler)
+signal.signal(signal.SIGTERM, cleanup_handler)
 
 def notify(title, body, icon=None, urgency="normal", progress=None, replace_id=None):
     log(f"NOTIFY: {title} - {body}")
@@ -133,7 +133,10 @@ def select_subtitles(video_id):
 
 def process_audio(video_id, mode):
     """Download and separate audio using high-quality htdemucs with Split & TCP Stream architecture."""
-    try: subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
+    # Cleanup existing processes for a fresh start
+    try: 
+        subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "-f", "mpv.*--title=walker-yt"], stderr=subprocess.DEVNULL)
     except: pass
 
     work_dir = os.path.join(CACHE_DIR, "proc_" + video_id)
@@ -217,7 +220,7 @@ def main():
     if not action_str: return
 
     url = f"https://www.youtube.com/watch?v={selected_video['id']}"
-    mpv_cmd = ["mpv", "--script-opts=ytdl_hook-ytdl_path=" + YT_DLP_BIN, "--force-window", "--cache=yes", "--cache-pause-wait=5", "--demuxer-readahead-secs=20"]
+    mpv_cmd = ["mpv", "--title=walker-yt", "--script-opts=ytdl_hook-ytdl_path=" + YT_DLP_BIN, "--force-window", "--cache=yes", "--cache-pause-wait=5", "--demuxer-readahead-secs=20"]
     
     video_format, sub_args = "bestvideo+bestaudio/best", []
     if "Select Quality" in action_str:
