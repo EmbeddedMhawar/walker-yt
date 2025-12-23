@@ -95,144 +95,96 @@ def download_thumbnail(url, video_id):
     return path
 
 def process_audio(video_id, mode):
-    """Download and separate audio with RAM-safe chunked processing."""
-    # mode: 'vocals' (keep vocals) or 'music' (keep music/no_vocals)
+    """Download and separate audio using a high-speed 'Split & Pipe' architecture."""
     
-    # Cleanup any existing demucs processes to free RAM
-    try:
-        subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    # Cleanup existing processes
+    try: subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
+    except: pass
 
-    nid = notify("Processing", "Step 1/2: Downloading audio...", urgency="critical", progress=0)
-    
     work_dir = os.path.join(CACHE_DIR, "proc_" + video_id)
     os.makedirs(work_dir, exist_ok=True)
     
-    # 1. Download Audio
+    # Paths
     audio_path = os.path.join(work_dir, "input.m4a")
+    chunks_dir = os.path.join(work_dir, "chunks")
+    out_chunks_dir = os.path.join(work_dir, "out_chunks")
+    # We use a raw PCM file for the "growing" audio stream
+    playback_file = os.path.join(work_dir, "live_audio.raw")
+    
+    if os.path.exists(playback_file): os.remove(playback_file)
+    os.makedirs(chunks_dir, exist_ok=True)
+    os.makedirs(out_chunks_dir, exist_ok=True)
+
+    nid = notify("Live Stream", "Step 1/3: Downloading & Splitting...", urgency="critical")
+
+    # 1. Download Audio (Fast)
     if not os.path.exists(audio_path):
         subprocess.run([
-            YT_DLP_BIN,
-            "-f", "bestaudio[ext=m4a]/bestaudio",
-            "-o", audio_path,
-            "--no-playlist",
-            video_id
+            YT_DLP_BIN, "-f", "bestaudio[ext=m4a]/bestaudio",
+            "-o", audio_path, "--no-playlist", video_id
         ], check=True)
+
+    # 2. Split into 30s chunks (Nearly Instant)
+    # Clear old chunks
+    for f in os.listdir(chunks_dir): os.remove(os.path.join(chunks_dir, f))
+    subprocess.run([
+        "ffmpeg", "-y", "-i", audio_path, 
+        "-f", "segment", "-segment_time", "30", 
+        "-c", "copy", os.path.join(chunks_dir, "chunk_%03d.m4a")
+    ], check=True)
+
+    sorted_chunks = sorted([f for f in os.listdir(chunks_dir) if f.endswith(".m4a")])
     
-    nid = notify("Processing", "Step 2/2: Separating stems (Buffer & Play)...", urgency="critical", progress=0, replace_id=nid)
+    nid = notify("Live Stream", f"Step 2/3: Separating (0/{len(sorted_chunks)})", urgency="critical", progress=0, replace_id=nid)
 
-    # 2. Run Demucs with RAM-safe flags and Hard isolation
-    # systemd-run --user --scope: Places the process in a memory-capped jail
-    # MemoryMax=10G: Hard limit to prevent system crash
-    # -n mdx_extra: Use a slightly more memory-efficient model than htdemucs
-    cmd = [
-        "systemd-run", "--user", "--scope",
-        "-p", "MemoryMax=10G",
-        "-p", "MemoryHigh=8G",
-        "-p", "CPUWeight=100",
-        "nice", "-n", "19",
-        "ionice", "-c", "3",
-        DEMUCS_BIN,
-        "-n", "mdx_extra",
-        "--two-stems=vocals",
-        "--segment", "4",
-        "--shifts", "0",
-        "-j", "4",
-        "-d", "cpu",
-        "-o", work_dir,
-        audio_path
-    ]
-    
-    # Environment variables to restrict resource usage
-    env = os.environ.copy()
-    env["OMP_NUM_THREADS"] = "4"
-    env["MKL_NUM_THREADS"] = "4"
-    env["VECLIB_MAXIMUM_THREADS"] = "4"
-    env["NUMEXPR_NUM_THREADS"] = "4"
+    def processing_worker():
+        """Background thread to process chunks one by one."""
+        total = len(sorted_chunks)
+        for i, chunk_file in enumerate(sorted_chunks):
+            chunk_path = os.path.join(chunks_dir, chunk_file)
+            
+            # Run Demucs on this tiny 30s chunk
+            cmd = [
+                DEMUCS_BIN, "-n", "mdx_extra", "--two-stems=vocals",
+                "-d", "cpu", "-j", "4",
+                "-o", out_chunks_dir, chunk_path
+            ]
+            
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # Find the output
+            chunk_base = os.path.splitext(chunk_file)[0]
+            stem_name = "vocals.wav" if mode == "vocals" else "no_vocals.wav"
+            separated_wav = os.path.join(out_chunks_dir, "mdx_extra", chunk_base, stem_name)
+            
+            if os.path.exists(separated_wav):
+                # Convert to raw PCM and append to the playback file
+                with open(playback_file, "ab") as f_out:
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i", separated_wav, 
+                        "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", "-"
+                    ], stdout=f_out, stderr=subprocess.DEVNULL)
 
-    # Output path
-    # Demucs creates a folder named after the model
-    model_name = "mdx_extra"
-    base_out = os.path.join(work_dir, model_name, "input")
-    target_file = os.path.join(base_out, "vocals.wav" if mode == "vocals" else "no_vocals.wav")
+            
+            # Update progress
+            percent = int(((i + 1) / total) * 100)
+            notify("Live Stream", f"Separating: Chunk {i+1}/{total}", urgency="low", progress=percent, replace_id=nid)
 
-    # Start Demucs
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-        universal_newlines=True,
-        env=env
-    )
+    # Start the worker in background
+    worker_thread = threading.Thread(target=processing_worker, daemon=True)
+    worker_thread.start()
 
-    last_errors = []
-    def monitor_progress(proc, notification_id, error_log):
-        buf = ""
-        last_percent = -1
-        try:
-            while True:
-                if proc.stderr:
-                    char = proc.stderr.read(1)
-                else:
-                    char = ""
-                if not char and proc.poll() is not None:
-                    break
-                if char:
-                    buf += char
-                    if char in ('\r', '\n'):
-                        line = buf.strip()
-                        if line:
-                            error_log.append(line)
-                            if len(error_log) > 10:
-                                error_log.pop(0)
-                        
-                        if "%" in buf:
-                            match = re.search(r'(\d+)%', buf)
-                            if match:
-                                percent = int(match.group(1))
-                                if percent != last_percent:
-                                    notify("Processing", f"Separating: {percent}%", urgency="critical", progress=percent, replace_id=notification_id)
-                                    last_percent = percent
-                        buf = ""
-            if proc.returncode == 0:
-                notify("Processing", "Done! Streaming audio...", urgency="normal", progress=100, replace_id=notification_id)
-        except Exception:
-            pass
+    # 3. Wait for the FIRST chunk to be ready before returning to main
+    start_time = time.time()
+    while not os.path.exists(playback_file) or os.path.getsize(playback_file) < 100000:
+        if not worker_thread.is_alive() and (not os.path.exists(playback_file) or os.path.getsize(playback_file) < 100000):
+            raise Exception("Processing worker died prematurely.")
+        if time.time() - start_time > 120:
+            raise Exception("Timeout waiting for first live chunk.")
+        time.sleep(1)
 
-    # Run monitor in background thread
-    threading.Thread(target=monitor_progress, args=(process, nid, last_errors), daemon=True).start()
-
-    try:
-        # Wait for the first chunk to be written (Buffer & Play)
-        start_time = time.time()
-        while not os.path.exists(target_file) or os.path.getsize(target_file) < 1024:
-            if process.poll() is not None:
-                # If process finished or failed before file created
-                if process.returncode != 0:
-                     stderr_out = "\n".join(last_errors)
-                     if not stderr_out:
-                         stderr_out = "Process died unexpectedly."
-                     
-                     if "OOM" in stderr_out or process.returncode in [137, 127]: # 137 is SIGKILL
-                         raise Exception("System killed Demucs to save RAM. Try a shorter video or close other apps.")
-                     raise Exception(f"Demucs failed: {stderr_out[:200]}")
-                break
-            if time.time() - start_time > 180: # 3 mins for safer start
-                raise Exception("Timeout waiting for audio buffer. Process may have been throttled or killed.")
-            time.sleep(1)
-    except Exception as e:
-        # If we time out or fail, kill the process so it doesn't become a zombie
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-        raise e
-
-    return target_file
+    notify("Live Stream", "Ready! Opening Player...", urgency="normal", progress=10, replace_id=nid)
+    return playback_file
 
 
 def get_video_qualities(video_id):
@@ -491,8 +443,20 @@ def main():
             # If we didn't select quality (rare case if I changed menu), default to bestvideo
             if "Select Quality" not in action_str:
                 video_format = "bestvideo"
+            
+            live_args = []
+            if audio_file.endswith(".raw"):
+                # Tell MPV how to interpret the raw PCM stream
+                live_args = [
+                    "--demuxer-rawaudio-rate=44100",
+                    "--demuxer-rawaudio-channels=2",
+                    "--demuxer-rawaudio-format=s16le",
+                    "--cache=yes",
+                    "--cache-pause-wait=5",
+                    "--demuxer-readahead-secs=60"
+                ]
                 
-            subprocess.Popen(mpv_cmd + [url, f"--ytdl-format={video_format}", f"--audio-file={audio_file}"] + sub_args)
+            subprocess.Popen(mpv_cmd + [url, f"--ytdl-format={video_format}", f"--audio-file={audio_file}"] + sub_args + live_args)
         except Exception as e:
             notify("Error", f"Processing failed: {e}")
 
