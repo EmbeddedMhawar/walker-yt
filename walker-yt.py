@@ -90,7 +90,7 @@ def download_thumbnail(url, video_id):
     return path
 
 def process_audio(video_id, mode):
-    """Download and separate audio using a high-quality 'Split & Pipe' architecture with FIFO."""
+    """Download and separate audio using high-quality htdemucs with optimized streaming."""
     
     # Cleanup existing processes
     try: subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
@@ -103,13 +103,10 @@ def process_audio(video_id, mode):
     audio_path = os.path.join(work_dir, "input.m4a")
     chunks_dir = os.path.join(work_dir, "chunks")
     out_chunks_dir = os.path.join(work_dir, "out_chunks")
+    # Using a regular file instead of FIFO for stability
+    playback_file = os.path.join(work_dir, "live_audio.pcm")
     
-    # Use a Named Pipe (FIFO) for the audio stream
-    fifo_path = os.path.join(tempfile.gettempdir(), f"walker_audio_{video_id}.fifo")
-    if os.path.exists(fifo_path):
-        os.remove(fifo_path)
-    os.mkfifo(fifo_path)
-    
+    if os.path.exists(playback_file): os.remove(playback_file)
     os.makedirs(chunks_dir, exist_ok=True)
     os.makedirs(out_chunks_dir, exist_ok=True)
 
@@ -134,14 +131,13 @@ def process_audio(video_id, mode):
     nid = notify("Live Stream", f"Step 2/3: Separating (0/{len(sorted_chunks)})", urgency="critical", progress=0, replace_id=nid)
 
     def processing_worker():
-        """Background thread to process chunks and feed the FIFO."""
+        """Background thread to process chunks and append to the PCM file."""
         try:
-            fifo_fd = None
             total = len(sorted_chunks)
             for i, chunk_file in enumerate(sorted_chunks):
                 chunk_path = os.path.join(chunks_dir, chunk_file)
                 
-                # Run htdemucs on 30s chunk with optimized settings
+                # Optimized Demucs settings for Intel CPU
                 cmd = [
                     "systemd-run", "--user", "--scope",
                     "-p", "MemoryMax=10G",
@@ -158,44 +154,35 @@ def process_audio(video_id, mode):
                 separated_wav = os.path.join(out_chunks_dir, "htdemucs", chunk_base, stem_name)
                 
                 if os.path.exists(separated_wav):
-                    if fifo_fd is None:
-                        # Opening FIFO for write blocks until reader (mpv) opens it
-                        fifo_fd = open(fifo_path, "wb")
-                    
-                    # Stream raw PCM to FIFO
-                    subprocess.run([
-                        "ffmpeg", "-y", "-i", separated_wav, 
-                        "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", "pipe:1"
-                    ], stdout=fifo_fd, stderr=subprocess.DEVNULL)
+                    # Append to growing PCM file
+                    with open(playback_file, "ab") as f_out:
+                        subprocess.run([
+                            "ffmpeg", "-y", "-i", separated_wav, 
+                            "-f", "s16le", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", "-"
+                        ], stdout=f_out, stderr=subprocess.DEVNULL)
+                        f_out.flush()
+                        os.fsync(f_out.fileno())
                 
                 percent = int(((i + 1) / total) * 100)
                 notify("Live Stream", f"Separating: Chunk {i+1}/{total}", urgency="low", progress=percent, replace_id=nid)
-            
-            if fifo_fd:
-                fifo_fd.close()
         except Exception as e:
             log(f"Worker Error: {e}")
 
-    # Start the worker in background
+    # Start the worker
     worker_thread = threading.Thread(target=processing_worker, daemon=True)
     worker_thread.start()
 
-    # 3. Wait for the FIRST chunk to be ready
-    first_chunk_base = os.path.splitext(sorted_chunks[0])[0]
-    stem_name = "vocals.wav" if mode == "vocals" else "no_vocals.wav"
-    first_separated = os.path.join(out_chunks_dir, "htdemucs", first_chunk_base, stem_name)
-    
+    # 3. Wait for the FIRST chunk to have data
     start_time = time.time()
-    while not os.path.exists(first_separated):
-        if not worker_thread.is_alive():
+    while not os.path.exists(playback_file) or os.path.getsize(playback_file) < 500000: # Wait for ~3s of audio
+        if not worker_thread.is_alive() and (not os.path.exists(playback_file) or os.path.getsize(playback_file) < 100000):
             raise Exception("Processing worker died.")
         if time.time() - start_time > 120:
-            raise Exception("Timeout waiting for first chunk.")
+            raise Exception("Timeout waiting for audio buffer.")
         time.sleep(1)
 
     notify("Live Stream", "Ready! Opening Player...", urgency="normal", progress=10, replace_id=nid)
-    return fifo_path
-
+    return playback_file, worker_thread
 
 
 def get_video_qualities(video_id):
@@ -382,7 +369,7 @@ def main():
     elif "Keep Vocals" in action_str or "Keep Music" in action_str:
         mode = "vocals" if "Keep Vocals" in action_str else "music"
         try:
-            audio_stream = process_audio(selected_video['id'], mode)
+            audio_pcm, worker = process_audio(selected_video['id'], mode)
             notify("Playing " + mode, selected_video['title'], thumb_path)
             
             if "Select Quality" not in action_str:
@@ -391,25 +378,28 @@ def main():
                 if "bestvideo" not in video_format:
                     video_format = "bestvideo"
             
-            # The player configuration for true live FIFO streaming
+            # THE CRITICAL FIX: Force mpv to treat the file as a live stream
             live_args = [
-                f"--audio-file={audio_stream}",
+                f"--audio-file={audio_pcm}",
                 "--audio-demuxer=rawaudio",
                 "--demuxer-rawaudio-rate=44100",
                 "--demuxer-rawaudio-channels=2",
                 "--demuxer-rawaudio-format=s16le",
-                "--audio-file-auto=no",
-                "--aid=1",
                 "--cache=yes",
-                "--cache-pause-wait=2",
-                "--demuxer-readahead-secs=60"
+                "--cache-secs=300", # Large buffer
+                "--demuxer-readahead-secs=60",
+                "--aid=1"
             ]
             
             final_cmd = mpv_cmd + [url, f"--ytdl-format={video_format}"] + live_args + sub_args
-            subprocess.Popen(final_cmd)
+            player_proc = subprocess.Popen(final_cmd)
+            
+            # Keep script alive while player or worker is running
+            while player_proc.poll() is None or worker.is_alive():
+                time.sleep(1)
+                
         except Exception as e:
             notify("Error", f"Processing failed: {e}")
-
 
 if __name__ == "__main__":
     main()
