@@ -116,12 +116,14 @@ def process_audio(video_id, mode):
     
     nid = notify("Processing", "Step 2/2: Separating stems (Buffer & Play)...", urgency="critical", progress=0, replace_id=nid)
 
-    # 2. Run Demucs with RAM-safe flags
-    # --segment 4: Smaller segments for even lower RAM usage
-    # --shifts 0: Reduces memory/CPU usage
-    # -j 1: Single thread for predictable memory footprint
-    # -d cpu: Force CPU to avoid unstable iGPU acceleration
+    # 2. Run Demucs with RAM-safe flags and Hard isolation
+    # systemd-run --user --scope: Places the process in a memory-capped jail
+    # MemoryMax=4G: System will kill Demucs if it hits 4G, saving your screen/Hyprland.
     cmd = [
+        "systemd-run", "--user", "--scope",
+        "-p", "MemoryMax=4G",
+        "-p", "MemoryHigh=3.5G",
+        "-p", "CPUWeight=20",
         "nice", "-n", "19",
         "ionice", "-c", "3",
         DEMUCS_BIN,
@@ -190,10 +192,12 @@ def process_audio(video_id, mode):
             # If process finished or failed before file created
             if process.returncode != 0:
                  stderr_out = process.stderr.read() if process.stderr else "Unknown error"
+                 if "OOM" in stderr_out or process.returncode in [137, 127]: # 137 is SIGKILL
+                     raise Exception("System killed Demucs to save RAM. Try a shorter video or close other apps.")
                  raise Exception(f"Demucs failed: {stderr_out[:200]}")
             break
-        if time.time() - start_time > 120: # Increase to 2 mins for large files/slow CPU
-            raise Exception("Timeout waiting for audio buffer. System might be too slow.")
+        if time.time() - start_time > 180: # 3 mins for safer start
+            raise Exception("Timeout waiting for audio buffer. Process may have been throttled or killed.")
         time.sleep(1)
 
     return target_file
