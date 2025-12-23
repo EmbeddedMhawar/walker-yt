@@ -261,9 +261,16 @@ def main():
             live_args = [f"--audio-file=tcp://127.0.0.1:{port}", "--audio-demuxer=rawaudio", "--demuxer-rawaudio-rate=44100", "--demuxer-rawaudio-channels=2", "--demuxer-rawaudio-format=s16le", "--cache=yes", "--cache-secs=300", "--aid=1"]
             if "Select Quality" not in action_str: video_format = "bestvideo"
             elif "bestvideo" not in video_format: video_format = "bestvideo"
-            subprocess.Popen(mpv_cmd + [url, f"--ytdl-format={video_format}"] + live_args + sub_args)
-            while worker.is_alive(): time.sleep(5)
-            time.sleep(30)
+            player_proc = subprocess.Popen(mpv_cmd + [url, f"--ytdl-format={video_format}"] + live_args + sub_args)
+            
+            # Wait for mpv to close
+            while player_proc.poll() is None:
+                time.sleep(1)
+            
+            log("MAIN: Player closed. Shutting down.")
+            # Safety: Kill demucs processes when player closes
+            try: subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
+            except: pass
         except Exception as e: notify("Error", f"Failed: {e}")
 
 if __name__ == "__main__": main()
