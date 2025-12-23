@@ -132,10 +132,12 @@ def process_audio(video_id, mode):
 
     def processing_worker():
         """Background thread to process chunks and append to the PCM file."""
+        log("WORKER: Started")
         try:
             total = len(sorted_chunks)
             for i, chunk_file in enumerate(sorted_chunks):
                 chunk_path = os.path.join(chunks_dir, chunk_file)
+                log(f"WORKER: Processing chunk {i+1}/{total}: {chunk_file}")
                 
                 # Optimized Demucs settings for Intel CPU
                 cmd = [
@@ -147,14 +149,21 @@ def process_audio(video_id, mode):
                     "-d", "cpu", "-j", "2",
                     "-o", out_chunks_dir, chunk_path
                 ]
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 
+                res = subprocess.run(cmd, capture_output=True, text=True)
+                if res.returncode != 0:
+                    log(f"WORKER: Demucs failed on chunk {i}: {res.stderr}")
+                    continue
+
                 chunk_base = os.path.splitext(chunk_file)[0]
                 stem_name = "vocals.wav" if mode == "vocals" else "no_vocals.wav"
                 separated_wav = os.path.join(out_chunks_dir, "htdemucs", chunk_base, stem_name)
                 
                 if os.path.exists(separated_wav):
-                    # Append to growing PCM file
+                    log(f"WORKER: Appending {separated_wav} to {playback_file}")
+                    # Convert to raw PCM and append
+                    # Using a temporary intermediate file to ensure atomic append if possible, 
+                    # or just direct ffmpeg to file.
                     with open(playback_file, "ab") as f_out:
                         subprocess.run([
                             "ffmpeg", "-y", "-i", separated_wav, 
@@ -162,11 +171,15 @@ def process_audio(video_id, mode):
                         ], stdout=f_out, stderr=subprocess.DEVNULL)
                         f_out.flush()
                         os.fsync(f_out.fileno())
+                    log(f"WORKER: Chunk {i+1} appended. New size: {os.path.getsize(playback_file)}")
+                else:
+                    log(f"WORKER: Separated file not found: {separated_wav}")
                 
                 percent = int(((i + 1) / total) * 100)
                 notify("Live Stream", f"Separating: Chunk {i+1}/{total}", urgency="low", progress=percent, replace_id=nid)
+            log("WORKER: Finished all chunks")
         except Exception as e:
-            log(f"Worker Error: {e}")
+            log(f"WORKER CRITICAL ERROR: {e}")
 
     # Start the worker
     worker_thread = threading.Thread(target=processing_worker, daemon=True)
@@ -378,27 +391,40 @@ def main():
                 if "bestvideo" not in video_format:
                     video_format = "bestvideo"
             
-            # THE CRITICAL FIX: Force mpv to treat the file as a live stream
+            # Use tail -f to stream the growing file to mpv
+            # This ensures mpv never hits EOF until we stop it
+            tail_cmd = ["tail", "-f", "-c", "+0", audio_pcm]
+            tail_proc = subprocess.Popen(tail_cmd, stdout=subprocess.PIPE)
+            
             live_args = [
-                f"--audio-file={audio_pcm}",
+                "--audio-file=fd://0", # Read from stdin (piped from tail)
                 "--audio-demuxer=rawaudio",
                 "--demuxer-rawaudio-rate=44100",
                 "--demuxer-rawaudio-channels=2",
                 "--demuxer-rawaudio-format=s16le",
                 "--cache=yes",
-                "--cache-secs=300", # Large buffer
+                "--cache-secs=300",
                 "--demuxer-readahead-secs=60",
                 "--aid=1"
             ]
             
             final_cmd = mpv_cmd + [url, f"--ytdl-format={video_format}"] + live_args + sub_args
-            player_proc = subprocess.Popen(final_cmd)
+            player_proc = subprocess.Popen(final_cmd, stdin=tail_proc.stdout)
             
-            # Keep script alive while player or worker is running
-            while player_proc.poll() is None or worker.is_alive():
+            # Close the pipe in parent so only tail and player own it
+            if tail_proc.stdout:
+                tail_proc.stdout.close()
+            
+            # Keep script alive while player is running
+            while player_proc.poll() is None:
                 time.sleep(1)
+            
+            # Cleanup
+            tail_proc.terminate()
+            log("MAIN: Player closed, cleaned up tail.")
                 
         except Exception as e:
+            log(f"MAIN ERROR: {e}")
             notify("Error", f"Processing failed: {e}")
 
 if __name__ == "__main__":
