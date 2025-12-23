@@ -158,8 +158,17 @@ def process_audio(video_id, mode):
             total = len(sorted_chunks)
             for i, chunk_file in enumerate(sorted_chunks):
                 chunk_path = os.path.join(chunks_dir, chunk_file)
-                cmd = ["systemd-run", "--user", "--scope", "-p", "MemoryMax=10G", "-p", "CPUWeight=100",
-                       DEMUCS_BIN, "-n", "htdemucs", "--two-stems=vocals", "--segment", "7", "--shifts", "0", "--overlap", "0.1", "-d", "cpu", "-j", "2", "-o", out_chunks_dir, chunk_path]
+                cmd = ["systemd-run", "--user", "--scope", 
+                       "-p", "MemoryMax=10G", 
+                       "-p", "CPUWeight=100",
+                       "-p", "CPUQuota=50%",
+                       "-E", "OMP_NUM_THREADS=1",
+                       "-E", "MKL_NUM_THREADS=1",
+                       "-E", "OPENBLAS_NUM_THREADS=1",
+                       "-E", "VECLIB_MAXIMUM_THREADS=1",
+                       DEMUCS_BIN, "-n", "htdemucs", "--two-stems=vocals", 
+                       "--segment", "7", "--shifts", "0", "--overlap", "0.1", 
+                       "-d", "cpu", "-j", "2", "-o", out_chunks_dir, chunk_path]
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 chunk_base = os.path.splitext(chunk_file)[0]
                 separated_wav = os.path.join(out_chunks_dir, "htdemucs", chunk_base, "vocals.wav" if mode == "vocals" else "no_vocals.wav")
