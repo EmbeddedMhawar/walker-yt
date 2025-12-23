@@ -9,9 +9,19 @@ import re
 import time
 import threading
 import socket
+import signal
 from concurrent.futures import ThreadPoolExecutor
 
-import signal
+# Configuration
+VENV_PATH = os.path.expanduser("~/.local/share/walker-yt/venv")
+DEMUCS_BIN = os.path.join(VENV_PATH, "bin", "demucs")
+YT_DLP_BIN = os.path.join(os.path.expanduser("~/.local/bin"), "yt-dlp")
+if not os.path.exists(YT_DLP_BIN):
+    YT_DLP_BIN = "yt-dlp"
+
+CACHE_DIR = os.path.expanduser("~/.cache/walker-yt")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 
 def log(message):
     with open("/tmp/walker-yt.log", "a") as f:
@@ -133,8 +143,16 @@ def select_subtitles(video_id):
 
 def process_audio(video_id, mode):
     """Download and separate audio using high-quality htdemucs with Split & TCP Stream architecture."""
-    # Cleanup existing processes for a fresh start
-    try: 
+    my_pid = os.getpid()
+    # Cleanup previous sessions: Kill old scripts, demucs, and players
+    try:
+        # Kill other walker-yt script instances
+        out = subprocess.check_output(["pgrep", "-f", "walker-yt"], text=True)
+        for pid_str in out.splitlines():
+            pid = int(pid_str)
+            if pid != my_pid:
+                os.kill(pid, signal.SIGTERM)
+        # Kill AI and Player
         subprocess.run(["pkill", "-f", "demucs"], stderr=subprocess.DEVNULL)
         subprocess.run(["pkill", "-f", "mpv.*--title=walker-yt"], stderr=subprocess.DEVNULL)
     except: pass
@@ -206,6 +224,7 @@ def main():
         query = proc.communicate()[0].strip()
     
     if not query: return
+    notify("Searching", f"Searching for: {query}...")
     videos = search_youtube(query)
     if not videos: return
 
