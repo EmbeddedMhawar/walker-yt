@@ -195,11 +195,21 @@ def process_audio(video_id, mode):
     worker_thread = threading.Thread(target=processing_worker, daemon=True)
     worker_thread.start()
 
+    # 3. Wait for TWO chunks to be processed for a better initial buffer
     start_time = time.time()
     while True:
-        if os.path.exists(playback_file) and os.path.getsize(playback_file) >= 500000: break
-        if not worker_thread.is_alive(): raise Exception("Worker died")
-        if time.time() - start_time > 120: raise Exception("Timeout")
+        if os.path.exists(playback_file):
+            size = os.path.getsize(playback_file)
+            # Each 30s chunk is ~5.3MB. Wait for 10MB (~2 chunks)
+            if size >= 10000000:
+                break
+            # If the video is short and worker finished, don't wait forever
+            if not worker_thread.is_alive():
+                if size > 0: break
+                raise Exception("Worker died without producing data")
+        
+        if time.time() - start_time > 240: # Increase timeout for 2 chunks
+            raise Exception("Timeout waiting for audio buffer (2 chunks)")
         time.sleep(1)
 
     notify("Live AI Stream", "Ready! Opening Player...", urgency="normal", progress=10, replace_id=nid)
